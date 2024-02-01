@@ -9,7 +9,17 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.11"
 transformers = "^4.37.1"
+beartype = "^0.17.0"
+torchtyping = "^0.1.4"
 
+
+[tool.poetry.group.train.dependencies]
+peft = "^0.8.1"
+datasets = "^2.16.1"
+accelerate = "^0.26.1"
+bitsandbytes = "^0.42.0"
+pytorch-warmup = "^0.1.1"
+tqdm = "^4.66.1"
 
 [build-system]
 requires = ["poetry-core"]
