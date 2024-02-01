@@ -1,3 +1,5 @@
+import os
+
 from beartype import beartype
 from beartype.typing import Optional, Dict, List, Tuple, Union, Callable, Type
 from torchtyping import TensorType
@@ -12,20 +14,23 @@ from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
 
-import transformers
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers.models.phi import PhiForCausalLM
+import humanize
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 from datasets import load_dataset
 
 from peft import LoraConfig, get_peft_model
 from peft import prepare_model_for_kbit_training
 
+from einops import rearrange, repeat
+
 from accelerate import Accelerator
 from pytorch_warmup import LinearWarmup
 
 from tqdm.auto import tqdm
+
 
 def cycle(dl):
     while True:
@@ -41,6 +46,11 @@ def default(v, d):
     return v if exists(v) else d
 
 
+def prompt_mask_from_len(length, seq):
+    seq_len, device = seq.shape[-1], seq.device
+    return torch.arange(seq_len, device=device) < rearrange(length, "... -> ... 1")
+
+
 def print_trainable_parameters(model):
     """
     Prints the number of trainable parameters in the model.
@@ -52,10 +62,8 @@ def print_trainable_parameters(model):
         if param.requires_grad:
             trainable_params += param.numel()
     print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+        f"trainable params: {humanize.naturalsize(trainable_params)} || all params: {humanize.naturalsize(all_param)} || trainable: {(100 * trainable_params / all_param):0.2f}%"
     )
-
-    qa_dataset = load_dataset("squad_v2")
 
 
 def create_prompt(context, question, answer):
@@ -232,6 +240,48 @@ def adam_optimizer_with_linear_decay(
     )
 
 
+class HFDataset(Dataset):
+    def __init__(self, dset):
+        self.dset = dset
+
+    def __getitem__(self, idx):
+        return self.dset[idx]
+
+    def __len__(self):
+        return len(self.dset)
+
+
+class GSMDataset(Dataset):
+    def __init__(self, tokenizer, examples):
+        self.examples = examples
+        self.qns = [ex["question"] for ex in self.examples]
+        self.ans = [ex["answer"] for ex in self.examples]
+        self.qns = tokenizer(self.qns, padding=False)
+        self.ans = tokenizer(self.ans, padding=False)
+        self.max_len = max(
+            [
+                len(self.qns["input_ids"][i]) + len(self.ans["input_ids"][i])
+                for i in range(len(self.examples))
+            ]
+        )
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        qn_tokens = self.qns["input_ids"][idx]
+        ans_tokens = self.ans["input_ids"][idx]
+        pad_tokens = [0] * (self.max_len - len(qn_tokens) - len(ans_tokens))
+        tokens = qn_tokens + ans_tokens + pad_tokens
+        mask = (
+            ([False] * len(qn_tokens))
+            + ([False] * len(ans_tokens))
+            + ([True] * len(pad_tokens))
+        )
+        assert len(mask) == len(tokens)    
+        return torch.tensor(tokens, dtype=torch.int), torch.tensor(mask, dtype=torch.bool)
+
+
 class SFTTrainer(Module):
     @beartype
     def __init__(
@@ -300,6 +350,22 @@ class SFTTrainer(Module):
     def wait(self):
         return self.accelerator.wait_for_everyone()
 
+    def get_cross_entropy_loss(
+        self,
+        seq: TensorType["batch", "seq", int],
+        prompt_mask: TensorType["batch", "seq", bool]
+    ):
+
+        seq, labels = seq[:, :-1], seq[:, 1:]
+
+        labels.masked_fill_(prompt_mask[:, 1:], self.ignore_index)
+
+        output = self.model(seq)
+
+        return F.cross_entropy(
+            rearrange(output.logits, "b n l -> b l n"), labels, ignore_index=self.ignore_index
+        )
+
     def forward(self):
         self.model.train()
 
@@ -348,23 +414,38 @@ class SFTTrainer(Module):
                 self.wait()
 
 
-def main(model_path="microsoft/phi-2"):
+def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
+    cuda = False
+    dtype = torch.float16
+    if torch.cuda.is_available():
+        cuda = True
+        dtype = torch.bfloat16
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = PhiForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.float16,
+        device_map="auto",
         trust_remote_code=True,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_quant_type="nf4",
+        )
+        if cuda
+        else None,
+        torch_dtype=dtype,
     )
 
     # prepare for training
     model.gradient_checkpointing_enable()
-    model = prepare_model_for_kbit_training(model)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     # LoRA
     config = LoraConfig(
-        r=8,
+        r=32,
         lora_alpha=32,
-        target_modules=["query_key_value"],
+        target_modules=["q_proj", "k_proj", "v_proj", "dense"],
+        modules_to_save=["lm_head", "embed_tokens"],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
@@ -374,33 +455,42 @@ def main(model_path="microsoft/phi-2"):
 
     tokenizer.pad_token = tokenizer.eos_token
 
-    # load dataset
-    train_examples = get_examples("train")
-    train_dset = GSMDataset(tokenizer, train_examples)
+    ds = load_dataset(sft_dataset_name, "main")
+    
+    train_test_dataset = ds["train"].train_test_split(test_size=0.1)
 
-    trainer = transformers.Trainer(
-        model=model,
-        train_dataset=mapped_qa_dataset["train"],
-        args=transformers.TrainingArguments(
-            per_device_train_batch_size=8,
-            gradient_accumulation_steps=8,
-            warmup_steps=100,
-            max_steps=100,
-            learning_rate=2e-4,
-            logging_steps=1,
-            output_dir="outputs",
-        ),
-        data_collator=transformers.DataCollatorForLanguageModeling(
-            tokenizer, mlm=False
-        ),
-    )
-    model.config.use_cache = (
-        False  # silence the warnings. Please re-enable for inference!
+    accelerator = Accelerator()
+
+    train = SFTTrainer(
+        model,
+        accelerator=accelerator,
+        train_dataset=GSMDataset(tokenizer, train_test_dataset["train"]),
+        valid_dataset=GSMDataset(tokenizer, train_test_dataset["test"]),
     )
 
-    trainer.train()
+    train()
 
-    from datasets import load_dataset
+    # trainer = transformers.Trainer(
+    #     model=model,
+    #     train_dataset=train_dataset,
+    #     args=transformers.TrainingArguments(
+    #         per_device_train_batch_size=8,
+    #         gradient_accumulation_steps=8,
+    #         warmup_steps=100,
+    #         max_steps=100,
+    #         learning_rate=2e-4,
+    #         logging_steps=1,
+    #         output_dir="outputs",
+    #     ),
+    #     data_collator=transformers.DataCollatorForLanguageModeling(
+    #         tokenizer, mlm=False
+    #     ),
+    # )
+    # model.config.use_cache = (
+    #     False  # silence the warnings. Please re-enable for inference!
+    # )
+
+    # trainer.train()
 
 
 if __name__ == "__main__":

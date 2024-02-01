@@ -20,6 +20,8 @@ accelerate = "^0.26.1"
 bitsandbytes = "^0.42.0"
 pytorch-warmup = "^0.1.1"
 tqdm = "^4.66.1"
+humanize = "^4.9.0"
+einops = "^0.7.0"
 
 [build-system]
 requires = ["poetry-core"]
