@@ -1,0 +1,24 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/models/pytorch/eval_gsm8k.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--model_module", "pytorch_microsoft_phi_model",
+                "--model_storage", "${workspaceFolder}/.cache/models/microsoft/phi-2",
+                "--evaluation_module", "gsm8k",
+                "--evaluation_storage",  "${workspaceFolder}/.cache/datasets/gsm8k" 
+            ],
+            "env":{
+                "PYTHONPATH": "${workspaceFolder}/models/pytorch"
+            }
+        }
+    ]
+}
