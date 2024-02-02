@@ -308,7 +308,8 @@ class SFTTrainer(Module):
         weight_decay: float = 0.0,
         adam_kwargs: dict = dict(),
         valid_every: int = 1,
-        collate_fn: Callable | None = None
+        collate_fn: Callable | None = None,
+        train_storage_folder: Path = None
     ):
         super().__init__()
         self.accelerator = accelerator
@@ -554,7 +555,8 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         valid_dataset=GSMDataset(tokenizer, train_valid_ds["test"], max_seq_len=512),
         collate_fn=collate,
         batch_size=8,
-        valid_every=len(train_valid_ds['train']) # every epoch
+        valid_every=len(train_valid_ds['train']), # every epoch
+        train_storage_folder="./train-model-weights"
     )
     
     train.save('phi-2-gsm8k') 
