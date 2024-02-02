@@ -291,7 +291,7 @@ class SFTTrainer(Module):
         accelerator: Accelerator,
         train_dataset: Dataset,
         valid_dataset: Dataset,
-        batch_size: int = 16,
+        batch_size: int = 1,
         grad_accum_steps: int = 2,
         num_epochs: int = 3,
         start_learning_rate: float = 5.5e-6,
@@ -414,6 +414,8 @@ class SFTTrainer(Module):
                 self.wait()
 
 
+from pytorch_microsoft_phi_model import PhiForCausalLM
+
 def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
     cuda = False
     dtype = torch.float16
@@ -421,11 +423,10 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         cuda = True
         dtype = torch.bfloat16
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = PhiForCausalLM.from_pretrained(
         model_path,
         device_map="auto",
-        trust_remote_code=True,
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=dtype,
@@ -438,6 +439,7 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
 
     # prepare for training
     model.gradient_checkpointing_enable()
+    model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     # LoRA
@@ -450,8 +452,9 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, config)
-    print_trainable_parameters(model)
+
+    # model = get_peft_model(model, config)
+    # print_trainable_parameters(model)
 
     tokenizer.pad_token = tokenizer.eos_token
 

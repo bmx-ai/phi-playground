@@ -1,0 +1,21 @@
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+  # We want to have a reproducible setup, so we don't want default channels,
+  # which may be different for different users. All required channels should
+  # be listed explicitly here.
+  - nodefaults
+
+dependencies:
+  - python=3.11
+  - cudatoolkit
+  - cudnn
+  - mamba
+  - numpy
+  - pip  # pip must be mentioned explicitly, or conda-lock will fail
+  - poetry=1.7.*  # or 1.1.*, or no version at all -- as you want
+
+# Non-standard section listing target platforms for conda-lock:
+platforms:
+  - linux-64
