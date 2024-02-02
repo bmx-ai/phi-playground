@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """ PyTorch Phi model."""
-
+import os
 
 import math
 from typing import List, Optional, Tuple, Union
@@ -1541,3 +1541,9 @@ class PhiForTokenClassification(PhiPreTrainedModel):
             hidden_states=model_outputs.hidden_states,
             attentions=model_outputs.attentions,
         )
+
+
+def load_from_checkpoint(path: str):
+    if not os.path.exists(path):
+        raise ValueError('path does not exists')
+    return PhiForCausalLM.from_pretrained(path)
