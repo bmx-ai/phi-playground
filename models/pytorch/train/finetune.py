@@ -309,7 +309,7 @@ class SFTTrainer(Module):
         adam_kwargs: dict = dict(),
         valid_every: int = 1,
         collate_fn: Callable | None = None,
-        train_storage_folder: Path = None
+        train_storage_folder: Path | None = None
     ):
         super().__init__()
         self.accelerator = accelerator
@@ -324,7 +324,7 @@ class SFTTrainer(Module):
         
         self._id = str(uuid.uuid1()).split('-')[0]
          
-        self.checkpoints_folder = Path(f'./{self._id}/checkpoints')
+        self.checkpoints_folder = Path(f'{train_storage_folder}/{self._id}/checkpoints')
         self.checkpoints_folder.mkdir(parents=True, exist_ok=True)
         
         self.num_train_steps = (
@@ -360,7 +360,9 @@ class SFTTrainer(Module):
 
     def log(self, **data):
         data['step'] = self.steps
-        logger.info(data, main_process_only=True)
+        for k,v in data.items():
+            print(k, ':', v)
+        self.accelerator.log(data)
 
     def wait(self):
         return self.accelerator.wait_for_everyone()
@@ -452,7 +454,7 @@ class SFTTrainer(Module):
 
         if self.accelerator.is_main_process:
             logger.info('checkpointing:start')
-            path = self.checkpoints_folder / (path + f'-{self.steps:04f}.ckpt')
+            path = self.checkpoints_folder / (path + f'-{self.steps:04d}.ckpt')
 
             assert not path.exists() or overwrite, f'file already exists'
 
@@ -556,7 +558,7 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         collate_fn=collate,
         batch_size=8,
         valid_every=len(train_valid_ds['train']), # every epoch
-        train_storage_folder="./train-model-weights"
+        train_storage_folder=Path("./train-model-weights")
     )
     
     train.save('phi-2-gsm8k') 
