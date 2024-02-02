@@ -252,13 +252,13 @@ class HFDataset(Dataset):
 
 
 class GSMDataset(Dataset):
-    def __init__(self, tokenizer, examples):
+    def __init__(self, tokenizer, examples, max_seq_len=None):
         self.examples = examples
         self.qns = [ex["question"] for ex in self.examples]
         self.ans = [ex["answer"] for ex in self.examples]
         self.qns = tokenizer(self.qns, padding=False)
         self.ans = tokenizer(self.ans, padding=False)
-        self.max_len = max(
+        self.max_len = max_seq_len if max_seq_len else max(
             [
                 len(self.qns["input_ids"][i]) + len(self.ans["input_ids"][i])
                 for i in range(len(self.examples))
@@ -279,7 +279,8 @@ class GSMDataset(Dataset):
             + ([True] * len(pad_tokens))
         )
         assert len(mask) == len(tokens)    
-        return torch.tensor(tokens, dtype=torch.int), torch.tensor(mask, dtype=torch.bool)
+        return dict(input_ids=torch.tensor(tokens, dtype=torch.int), 
+                    attention_mask=torch.tensor(mask, dtype=torch.bool))
 
 
 class SFTTrainer(Module):
@@ -352,15 +353,16 @@ class SFTTrainer(Module):
 
     def get_cross_entropy_loss(
         self,
-        seq: TensorType["batch", "seq", int],
-        prompt_mask: TensorType["batch", "seq", bool]
+        prompt_and_mask: dict
     ):
 
+        seq: TensorType["batch", "seq", int] = prompt_and_mask['input_ids']
+        prompt_mask: TensorType["batch", "seq", bool] = prompt_and_mask['attention_mask']
         seq, labels = seq[:, :-1], seq[:, 1:]
 
         labels.masked_fill_(prompt_mask[:, 1:], self.ignore_index)
 
-        output = self.model(seq)
+        output = self.model(**prompt_and_mask)
 
         return F.cross_entropy(
             rearrange(output.logits, "b n l -> b l n"), labels, ignore_index=self.ignore_index
@@ -376,9 +378,9 @@ class SFTTrainer(Module):
                 self.accelerator, self.model, self.grad_accum_steps
             ):
                 with forward_context():
-                    seq, prompt_len_or_mask = next(train_dl_iter)
+                    prompt_and_mask = next(train_dl_iter)
 
-                    loss = self.get_cross_entropy_loss(seq, prompt_len_or_mask)
+                    loss = self.get_cross_entropy_loss(prompt_and_mask)
 
                     self.accelerator.backward(loss / self.grad_accum_steps)
 
@@ -415,6 +417,7 @@ class SFTTrainer(Module):
 
 
 from pytorch_microsoft_phi_model import PhiForCausalLM
+#
 
 def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
     cuda = False
@@ -453,47 +456,91 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         task_type="CAUSAL_LM",
     )
 
-    # model = get_peft_model(model, config)
-    # print_trainable_parameters(model)
+    model = get_peft_model(model, config)
+    print_trainable_parameters(model)
 
     tokenizer.pad_token = tokenizer.eos_token
 
-    ds = load_dataset(sft_dataset_name, "main")
+    ds = load_dataset(sft_dataset_name, 'main')
+
+    #accelerator = Accelerator()
+
+    # This special index is used to ignore certain tokens during loss calculation.  (??)
+    IGNORE_INDEX = -100  
+ 
+    # collate function - to transform list of dictionaries [ {input_ids: [123, ..]}, {.. ] to a single dictionary forming a batch { input_ids: [..], labels: [..], attention_mask: [..] }  
+    def collate(elements):  
     
-    train_test_dataset = ds["train"].train_test_split(test_size=0.1)
-
-    accelerator = Accelerator()
-
-    train = SFTTrainer(
-        model,
-        accelerator=accelerator,
-        train_dataset=GSMDataset(tokenizer, train_test_dataset["train"]),
-        valid_dataset=GSMDataset(tokenizer, train_test_dataset["test"]),
-    )
-
-    train()
-
-    # trainer = transformers.Trainer(
-    #     model=model,
-    #     train_dataset=train_dataset,
-    #     args=transformers.TrainingArguments(
-    #         per_device_train_batch_size=8,
-    #         gradient_accumulation_steps=8,
-    #         warmup_steps=100,
-    #         max_steps=100,
-    #         learning_rate=2e-4,
-    #         logging_steps=1,
-    #         output_dir="outputs",
-    #     ),
-    #     data_collator=transformers.DataCollatorForLanguageModeling(
-    #         tokenizer, mlm=False
-    #     ),
-    # )
-    # model.config.use_cache = (
-    #     False  # silence the warnings. Please re-enable for inference!
+        # Extract input_ids from each element and find the maximum length among them 
+        tokens = [e["input_ids"] for e in elements]  
+        tokens_maxlen = max([len(t) for t in tokens])  
+    
+        for i, sample in enumerate(elements):  
+            input_ids = sample["input_ids"]  
+            labels = sample["labels"]  
+            attention_mask = sample["attention_mask"]  
+    
+            # Calculate the padding length required to match the maximum token length  
+            pad_len = tokens_maxlen-len(input_ids)  
+    
+            # Pad 'input_ids' with the pad token ID, 'labels' with IGNORE_INDEX, and 'attention_mask' with 0  
+            input_ids.extend( pad_len * [tokenizer.pad_token_id] )  
+            labels.extend( pad_len * [IGNORE_INDEX] )  
+            attention_mask.extend( pad_len * [0] )  
+    
+        # create and return batch with all the data in elements  
+        batch={  
+            "input_ids": torch.tensor( [e["input_ids"] for e in elements] ),  
+            "labels": torch.tensor( [e["labels"] for e in elements] ),  
+            "attention_mask": torch.tensor( [e["attention_mask"] for e in elements] ),  
+        }  
+        return batch
+    # train = SFTTrainer(
+    #     model,
+    #     accelerator=accelerator,
+    #     train_dataset=GSMDataset(tokenizer, ds["train"], max_seq_len=512),
+    #     valid_dataset=GSMDataset(tokenizer, ds["test"], max_seq_len=512),
     # )
 
-    # trainer.train()
+    # train()
+    from transformers import TrainingArguments, Trainer  
+
+    bs=1         # batch size  
+    ga_steps=16  # gradient acc. steps  
+    epochs=20  
+    lr=0.00002  
+    
+    steps_per_epoch=len(ds["train"])//(bs*ga_steps)  
+    
+    args = TrainingArguments(  
+        output_dir="out",  
+        per_device_train_batch_size=bs,  
+        per_device_eval_batch_size=16, 
+        evaluation_strategy="steps",  
+        logging_steps=1,  
+        eval_steps=steps_per_epoch//2,      # eval twice per epoch  
+        save_steps=steps_per_epoch,         # save once per epoch  
+        gradient_accumulation_steps=ga_steps,  
+        num_train_epochs=epochs,  
+        lr_scheduler_type="constant",  
+        optim="paged_adamw_32bit",      # val_loss will go NaN with paged_adamw_8bit  
+        learning_rate=lr,  
+        group_by_length=False,  
+        bf16=True,  
+        ddp_find_unused_parameters=False,  
+    )  
+    
+    trainer = Trainer(  
+        model=model,  
+        tokenizer=tokenizer,  
+        args=args,  
+        data_collator=collate,  
+        train_dataset=ds["train"],  
+        eval_dataset=ds["test"],  
+    )  
+    
+    print('training') 
+    trainer.train()
 
 
 if __name__ == "__main__":

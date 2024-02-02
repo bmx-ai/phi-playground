@@ -11,6 +11,7 @@ python = "^3.11"
 transformers = "^4.37.1"
 beartype = "^0.17.0"
 torchtyping = "^0.1.4"
+conda-lock = "^2.5.2"
 
 
 [tool.poetry.group.train.dependencies]
