@@ -3,7 +3,7 @@
 # input_hash: 79ca35289373eeddf615bfb24a52c3953cf28e8c4d90bfa54d6df8b8e2a63558
 @EXPLICIT
 https://conda.anaconda.org/conda-forge/linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2#d7c89558ba9fa0495403155b64376d81
-https://conda.anaconda.org/conda-forge/linux-64/ca-certificates-2023.11.17-hbcca054_0.conda#01ffc8d36f9eba0ce0b3c1955fa780ee
+https://conda.anaconda.org/conda-forge/linux-64/ca-certificates-2024.2.2-hbcca054_0.conda#2f4327a1cbe7f022401b236e915a5fef
 https://conda.anaconda.org/nvidia/linux-64/cuda-cudart-12.1.105-0.tar.bz2#001823a01c0d49300fd9622c4578eb40
 https://conda.anaconda.org/nvidia/linux-64/cuda-cupti-12.1.105-0.tar.bz2#c0bfa9a714fd8099e085c70ab2ebe6ec
 https://conda.anaconda.org/nvidia/linux-64/cuda-nvrtc-12.1.105-0.tar.bz2#12c15423c4eeb41fee6df3a2e5ab53ab

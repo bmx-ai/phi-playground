@@ -489,6 +489,7 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         train_dataset=GSMDataset(tokenizer, train_valid_ds["train"], max_seq_len=512),
         valid_dataset=GSMDataset(tokenizer, train_valid_ds["test"], max_seq_len=512),
         collate_fn=collate,
+        batch_size=4,
         valid_every=len(train_valid_ds['train']) # every epoch
     )
 
