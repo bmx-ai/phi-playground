@@ -14,6 +14,7 @@ from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import default_collate
 import torch.nn.functional as F
 
 import humanize
@@ -251,36 +252,35 @@ class HFDataset(Dataset):
         return len(self.dset)
 
 
+# This special index is used to ignore certain tokens during loss calculation.  (??)
+IGNORE_INDEX = -100   
+
+# def evaluate_batch_cross_entropy_loss(
+#     model_output,
+#     labels,
+# ):
+#     return F.cross_entropy(
+#         rearrange(logits, "b n l -> b l n"), labels, ignore_index=IGNORE_INDEX
+#     )
+
 class GSMDataset(Dataset):
     def __init__(self, tokenizer, examples, max_seq_len=None):
-        self.examples = examples
-        self.qns = [ex["question"] for ex in self.examples]
-        self.ans = [ex["answer"] for ex in self.examples]
-        self.qns = tokenizer(self.qns, padding=False)
-        self.ans = tokenizer(self.ans, padding=False)
-        self.max_len = max_seq_len if max_seq_len else max(
-            [
-                len(self.qns["input_ids"][i]) + len(self.ans["input_ids"][i])
-                for i in range(len(self.examples))
-            ]
-        )
-
+        self._examples = examples
+        self._max_length = max_seq_len
+        self._tokenizer = tokenizer
+        
     def __len__(self):
-        return len(self.examples)
+        return len(self._examples)
 
     def __getitem__(self, idx):
-        qn_tokens = self.qns["input_ids"][idx]
-        ans_tokens = self.ans["input_ids"][idx]
-        pad_tokens = [0] * (self.max_len - len(qn_tokens) - len(ans_tokens))
-        tokens = qn_tokens + ans_tokens + pad_tokens
-        mask = (
-            ([False] * len(qn_tokens))
-            + ([False] * len(ans_tokens))
-            + ([True] * len(pad_tokens))
-        )
-        assert len(mask) == len(tokens)    
-        return dict(input_ids=torch.tensor(tokens, dtype=torch.int), 
-                    attention_mask=torch.tensor(mask, dtype=torch.bool))
+        assert idx < len(self._examples)
+        
+        ex = self._examples[idx]
+        
+        qns = ex["question"]
+        ans = ex["answer"]
+        
+        return self._tokenizer(qns + ans, padding=False)
 
 
 class SFTTrainer(Module):
@@ -292,26 +292,26 @@ class SFTTrainer(Module):
         accelerator: Accelerator,
         train_dataset: Dataset,
         valid_dataset: Dataset,
-        batch_size: int = 1,
+        batch_size: int = 8,
         grad_accum_steps: int = 2,
         num_epochs: int = 3,
         start_learning_rate: float = 5.5e-6,
         end_learning_rate: float = 1.1e-6,
         learning_rate_num_decay_steps: Optional[int] = None,
         weight_decay: float = 0.0,
-        ignore_index: int = -1,
         adam_kwargs: dict = dict(),
         valid_every: int = 1,
+        collate_fn: Callable | None = None
     ):
         super().__init__()
         self.accelerator = accelerator
         self.model = model
 
         self.num_epochs = num_epochs
-        self.ignore_index = ignore_index
 
         self.train_dataloader = DataLoader(
-            train_dataset, batch_size=batch_size, drop_last=True, shuffle=True
+            train_dataset, batch_size=batch_size, drop_last=True, shuffle=True,
+            collate_fn=collate_fn
         )
 
         self.num_train_steps = (
@@ -341,7 +341,7 @@ class SFTTrainer(Module):
 
         self.valid_dataloader = None
         if exists(valid_dataset):
-            self.valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size)
+            self.valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, collate_fn=collate_fn)
 
         self.steps = 0
 
@@ -350,23 +350,6 @@ class SFTTrainer(Module):
 
     def wait(self):
         return self.accelerator.wait_for_everyone()
-
-    def get_cross_entropy_loss(
-        self,
-        prompt_and_mask: dict
-    ):
-
-        seq: TensorType["batch", "seq", int] = prompt_and_mask['input_ids']
-        prompt_mask: TensorType["batch", "seq", bool] = prompt_and_mask['attention_mask']
-        seq, labels = seq[:, :-1], seq[:, 1:]
-
-        labels.masked_fill_(prompt_mask[:, 1:], self.ignore_index)
-
-        output = self.model(**prompt_and_mask)
-
-        return F.cross_entropy(
-            rearrange(output.logits, "b n l -> b l n"), labels, ignore_index=self.ignore_index
-        )
 
     def forward(self):
         self.model.train()
@@ -380,8 +363,9 @@ class SFTTrainer(Module):
                 with forward_context():
                     prompt_and_mask = next(train_dl_iter)
 
-                    loss = self.get_cross_entropy_loss(prompt_and_mask)
-
+                    #loss = self.get_cross_entropy_loss(prompt_and_mask)
+                    output = self.model(**prompt_and_mask)
+                    loss = output.loss
                     self.accelerator.backward(loss / self.grad_accum_steps)
 
             self.optimizer.step()
@@ -401,10 +385,11 @@ class SFTTrainer(Module):
                     self.model.eval()
 
                     with torch.no_grad():
-                        for seq, prompt_len_or_mask in self.valid_dataloader:
+                        for validation_batch in tqdm(self.valid_dataloader, desc='validating'):
+                            seq = validation_batch['input_ids']
                             batch = seq.shape[0]
 
-                            loss = self.get_cross_entropy_loss(seq, prompt_len_or_mask)
+                            loss = self.model(**validation_batch).loss
 
                             total_valid_loss += loss.item() * batch
                             total_batches += batch
@@ -426,7 +411,7 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         cuda = True
         dtype = torch.bfloat16
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = PhiForCausalLM.from_pretrained(
         model_path,
         device_map="auto",
@@ -463,84 +448,89 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
 
     ds = load_dataset(sft_dataset_name, 'main')
 
-    #accelerator = Accelerator()
-
-    # This special index is used to ignore certain tokens during loss calculation.  (??)
-    IGNORE_INDEX = -100  
+    accelerator = Accelerator()
  
     # collate function - to transform list of dictionaries [ {input_ids: [123, ..]}, {.. ] to a single dictionary forming a batch { input_ids: [..], labels: [..], attention_mask: [..] }  
-    def collate(elements):  
+    def collate(examples):  
     
         # Extract input_ids from each element and find the maximum length among them 
-        tokens = [e["input_ids"] for e in elements]  
+        tokens = [e["input_ids"] for e in examples]  
         tokens_maxlen = max([len(t) for t in tokens])  
     
-        for i, sample in enumerate(elements):  
+        for sample in examples:  
             input_ids = sample["input_ids"]  
-            labels = sample["labels"]  
             attention_mask = sample["attention_mask"]  
+            
+            labels = input_ids[1:]
     
             # Calculate the padding length required to match the maximum token length  
             pad_len = tokens_maxlen-len(input_ids)  
     
             # Pad 'input_ids' with the pad token ID, 'labels' with IGNORE_INDEX, and 'attention_mask' with 0  
             input_ids.extend( pad_len * [tokenizer.pad_token_id] )  
-            labels.extend( pad_len * [IGNORE_INDEX] )  
+            labels.extend( (pad_len + 1) * [IGNORE_INDEX] )  
             attention_mask.extend( pad_len * [0] )  
-    
+            
+            sample['labels'] = labels
+            
         # create and return batch with all the data in elements  
         batch={  
-            "input_ids": torch.tensor( [e["input_ids"] for e in elements] ),  
-            "labels": torch.tensor( [e["labels"] for e in elements] ),  
-            "attention_mask": torch.tensor( [e["attention_mask"] for e in elements] ),  
+            "input_ids": torch.tensor( [e["input_ids"] for e in examples] ),  
+            "labels": torch.tensor( [e["labels"] for e in examples] ),  
+            "attention_mask": torch.tensor( [e["attention_mask"] for e in examples] ),  
         }  
         return batch
-    # train = SFTTrainer(
-    #     model,
-    #     accelerator=accelerator,
-    #     train_dataset=GSMDataset(tokenizer, ds["train"], max_seq_len=512),
-    #     valid_dataset=GSMDataset(tokenizer, ds["test"], max_seq_len=512),
-    # )
+    
+    train_valid_ds = ds["train"].train_test_split(test_size=0.1)
 
-    # train()
-    from transformers import TrainingArguments, Trainer  
+    train = SFTTrainer(
+        model,
+        accelerator=accelerator,
+        train_dataset=GSMDataset(tokenizer, train_valid_ds["train"], max_seq_len=512),
+        valid_dataset=GSMDataset(tokenizer, train_valid_ds["test"], max_seq_len=512),
+        collate_fn=collate,
+        valid_every=len(train_valid_ds['train']) # every epoch
+    )
 
-    bs=1         # batch size  
-    ga_steps=16  # gradient acc. steps  
-    epochs=20  
-    lr=0.00002  
+    train()
+    # from transformers import TrainingArguments, Trainer  
+
+    # bs=1         # batch size  
+    # ga_steps=16  # gradient acc. steps  
+    # epochs=20  
+    # lr=0.00002  
     
-    steps_per_epoch=len(ds["train"])//(bs*ga_steps)  
+    # steps_per_epoch=len(ds["train"])//(bs*ga_steps)  
     
-    args = TrainingArguments(  
-        output_dir="out",  
-        per_device_train_batch_size=bs,  
-        per_device_eval_batch_size=16, 
-        evaluation_strategy="steps",  
-        logging_steps=1,  
-        eval_steps=steps_per_epoch//2,      # eval twice per epoch  
-        save_steps=steps_per_epoch,         # save once per epoch  
-        gradient_accumulation_steps=ga_steps,  
-        num_train_epochs=epochs,  
-        lr_scheduler_type="constant",  
-        optim="paged_adamw_32bit",      # val_loss will go NaN with paged_adamw_8bit  
-        learning_rate=lr,  
-        group_by_length=False,  
-        bf16=True,  
-        ddp_find_unused_parameters=False,  
-    )  
+    # args = TrainingArguments(  
+    #     output_dir="out",  
+    #     per_device_train_batch_size=bs,  
+    #     per_device_eval_batch_size=16, 
+    #     evaluation_strategy="steps",  
+    #     logging_steps=1,  
+    #     eval_steps=steps_per_epoch//2,      # eval twice per epoch  
+    #     save_steps=steps_per_epoch,         # save once per epoch  
+    #     gradient_accumulation_steps=ga_steps,  
+    #     num_train_epochs=epochs,  
+    #     lr_scheduler_type="constant",  
+    #     optim="paged_adamw_32bit",      # val_loss will go NaN with paged_adamw_8bit  
+    #     learning_rate=lr,  
+    #     group_by_length=False,  
+    #     bf16=True,  
+    #     ddp_find_unused_parameters=False,  
+    # )  
     
-    trainer = Trainer(  
-        model=model,  
-        tokenizer=tokenizer,  
-        args=args,  
-        data_collator=collate,  
-        train_dataset=ds["train"],  
-        eval_dataset=ds["test"],  
-    )  
+    # trainer = Trainer(  
+    #     model=model,  
+    #     tokenizer=tokenizer,  
+    #     args=args,  
+    #     data_collator=collate,  
+    #     train_dataset=ds["train"],  
+    #     eval_dataset=ds["test"],  
+    # )  
     
-    print('training') 
-    trainer.train()
+    # print('training') 
+    # trainer.train()
 
 
 if __name__ == "__main__":
