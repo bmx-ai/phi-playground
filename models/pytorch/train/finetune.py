@@ -1,7 +1,11 @@
 import os
+import math
+import sys
+import uuid
+from pathlib import Path
 
 from beartype import beartype
-from beartype.typing import Optional, Dict, List, Tuple, Union, Callable, Type
+from beartype.typing import Optional, Dict, List, Tuple, Union, Callable, Type, Any
 from torchtyping import TensorType
 
 from contextlib import nullcontext, contextmanager
@@ -31,6 +35,9 @@ from accelerate import Accelerator
 from pytorch_warmup import LinearWarmup
 
 from tqdm.auto import tqdm
+
+from accelerate.logging import get_logger
+logger = get_logger('finetune')
 
 
 def cycle(dl):
@@ -313,7 +320,12 @@ class SFTTrainer(Module):
             train_dataset, batch_size=batch_size, drop_last=True, shuffle=True,
             collate_fn=collate_fn
         )
-
+        
+        self._id = str(uuid.uuid1()).split('-')[0]
+         
+        self.checkpoints_folder = Path(f'./{self._id}/checkpoints')
+        self.checkpoints_folder.mkdir(parents=True, exist_ok=True)
+        
         self.num_train_steps = (
             len(self.train_dataloader) // grad_accum_steps * num_epochs
         )
@@ -346,17 +358,19 @@ class SFTTrainer(Module):
         self.steps = 0
 
     def log(self, **data):
-        self.accelerator.log(data, step=self.steps)
+        data['step'] = self.steps
+        logger.info(data, main_process_only=True)
 
     def wait(self):
         return self.accelerator.wait_for_everyone()
 
     def forward(self):
         self.model.train()
-
+        self.min_train_loss  = torch.inf
+        
         train_dl_iter = cycle(self.train_dataloader)
-
-        for step in tqdm(range(self.num_train_steps), desc="training"):
+        pbar = tqdm(range(self.num_train_steps), desc="training")
+        for step in pbar:
             for forward_context in model_forward_contexts(
                 self.accelerator, self.model, self.grad_accum_steps
             ):
@@ -365,17 +379,32 @@ class SFTTrainer(Module):
 
                     #loss = self.get_cross_entropy_loss(prompt_and_mask)
                     output = self.model(**prompt_and_mask)
-                    loss = output.loss
-                    self.accelerator.backward(loss / self.grad_accum_steps)
-
+                    ce_batch_loss = output.loss
+                    self.accelerator.backward(ce_batch_loss / self.grad_accum_steps)
+            
             self.optimizer.step()
+            metrics = {}
+            # Collect metrics and check for NaN loss.
+            # NOTE: this involves a bunch of host-device syncs so we wait until the last moment to do this.
+            if torch.isnan(ce_batch_loss):
+                raise ValueError("nan loss encountered")
+            #if z_batch_loss is not None and torch.isnan(z_batch_loss):
+            #    raise ValueError("nan loss encountered")
+            # for key, value in optim_metrics.items():
+            #     metrics[f"optim/{key}"] = value.item()
+            self.cur_train_loss = ce_batch_loss.item()
+            self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
+            metrics["train/cross-entropy-loss"] = self.cur_train_loss
+            metrics["train/perplexity"] = math.exp(self.cur_train_loss)
+            # if z_batch_loss is not None:
+            #    metrics["train/ZLoss"] = z_batch_loss.item()
+            self.log(**metrics) 
             self.optimizer.zero_grad()
-
-            self.log(loss=loss.item())
 
             self.steps += 1
 
-            if exists(self.valid_dataloader) and not (step % self.valid_every):
+            # validate
+            if exists(self.valid_dataloader) and not (step % self.valid_every) and self.steps > 1:
                 self.wait()
 
                 if self.accelerator.is_main_process:
@@ -389,17 +418,52 @@ class SFTTrainer(Module):
                             seq = validation_batch['input_ids']
                             batch = seq.shape[0]
 
-                            loss = self.model(**validation_batch).loss
+                            ce_batch_loss = self.model(**validation_batch).loss
 
-                            total_valid_loss += loss.item() * batch
+                            total_valid_loss += ce_batch_loss.item() * batch
                             total_batches += batch
 
-                    valid_loss = total_valid_loss / total_batches
+
+                        valid_loss = total_valid_loss / total_batches
 
                     self.log(valid_loss=valid_loss)
 
                 self.wait()
+                self.model.train()
+                
+    def load_checkpoint(self, path):
+        self.wait()
+        if self.accelerator.is_main_process:
+            path = self.checkpoints_folder / path 
+            persisted_state = torch.load(path)
+            self.model.load_state_dict(persisted_state['model'])
+            self.optimizer.load_state_dict(persisted_state['optimizer'])
+            self.steps = persisted_state['global_step']
 
+        self.wait()
+   
+    @property
+    def unwrapped_model(self):
+        return self.accelerator.unwrap_model(self.model)
+            
+    def save(self, path: str, overwrite: bool = False):
+        self.wait()
+
+        if self.accelerator.is_main_process:
+            logger.info('checkpointing:start')
+            path = self.checkpoints_folder / (path + f'-{self.steps:04f}.ckpt')
+
+            assert not path.exists() or overwrite, f'file already exists'
+
+            pkg = dict(
+                global_step = self.steps,
+                optimizer = self.optimizer.state_dict(),
+                model = self.unwrapped_model.state_dict()
+            )
+
+            torch.save(pkg, str(path))
+            logger.info('checkpointing:end')
+        self.wait()
 
 from pytorch_microsoft_phi_model import PhiForCausalLM
 #
@@ -446,9 +510,8 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
 
     tokenizer.pad_token = tokenizer.eos_token
 
-    ds = load_dataset(sft_dataset_name, 'main')
-
     accelerator = Accelerator()
+    accelerator.init_trackers('sft-train-%s' % sft_dataset_name)
  
     # collate function - to transform list of dictionaries [ {input_ids: [123, ..]}, {.. ] to a single dictionary forming a batch { input_ids: [..], labels: [..], attention_mask: [..] }  
     def collate(examples):  
@@ -481,7 +544,8 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         }  
         return batch
     
-    train_valid_ds = ds["train"].train_test_split(test_size=0.1)
+    ds = load_dataset(sft_dataset_name, 'main', split='train[:1%]')
+    train_valid_ds = ds.train_test_split(test_size=0.1)
 
     train = SFTTrainer(
         model,
@@ -489,11 +553,15 @@ def main(model_path="microsoft/phi-2", sft_dataset_name="gsm8k"):
         train_dataset=GSMDataset(tokenizer, train_valid_ds["train"], max_seq_len=512),
         valid_dataset=GSMDataset(tokenizer, train_valid_ds["test"], max_seq_len=512),
         collate_fn=collate,
-        batch_size=4,
+        batch_size=8,
         valid_every=len(train_valid_ds['train']) # every epoch
     )
+    
+    train.save('phi-2-gsm8k') 
 
     train()
+    
+    train.save('phi-2-gsm8k') 
     # from transformers import TrainingArguments, Trainer  
 
     # bs=1         # batch size  

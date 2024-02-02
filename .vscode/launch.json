@@ -5,7 +5,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "train: phi-2",
+            "name": "debug:train:phi-2",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/models/pytorch/train/finetune.py",
@@ -13,6 +13,18 @@
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/models/pytorch",
                 "CUDA_LAUNCH_BLOCKING": "1",
+            }
+        },
+        {
+            "name": "train: phi-2",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.accelerate_cli",
+            "args": ["launch", "${workspaceFolder}/models/pytorch/train/finetune.py"],
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/models/pytorch",
+                "ACCELERATE_LOG_LEVEL": "DEBUG"
             }
         }
     ]
