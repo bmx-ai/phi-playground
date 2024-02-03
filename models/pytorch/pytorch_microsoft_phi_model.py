@@ -1549,6 +1549,6 @@ def load_from_checkpoint(path: str):
     if not os.path.exists(path):
         raise ValueError('path does not exists')
     model = PhiForCausalLM.from_pretrained(path)
-    tokenizer = AutoTokenizer.from_pretrained(path)
+    tokenizer = AutoTokenizer.from_pretrained(path, add_eos_token=True)
 
     return model, tokenizer
