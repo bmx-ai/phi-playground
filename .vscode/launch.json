@@ -11,13 +11,44 @@
             "program": "${workspaceFolder}/models/pytorch/eval_gsm8k.py",
             "console": "integratedTerminal",
             "args": [
-                "--model_module", "pytorch_microsoft_phi_model",
-                "--model_storage", "${workspaceFolder}/.cache/models/microsoft/phi-2",
-                "--evaluation_module", "gsm8k",
-                "--evaluation_storage",  "${workspaceFolder}/.cache/datasets/gsm8k" 
+                "--model_module",
+                "pytorch_microsoft_phi_model",
+                "--model_storage",
+                "${workspaceFolder}/.cache/models/microsoft/phi-2",
+                "--evaluation_module",
+                "gsm8k",
+                "--evaluation_storage",
+                "${workspaceFolder}/.cache/datasets/gsm8k"
             ],
-            "env":{
+            "env": {
                 "PYTHONPATH": "${workspaceFolder}/models/pytorch"
+            }
+        },
+        {
+            "name": "debug:train:phi-2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/models/pytorch/train/finetune.py",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/models/pytorch",
+                "CUDA_LAUNCH_BLOCKING": "1",
+            }
+        },
+        {
+            "name": "train: phi-2",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.accelerate_cli",
+            "args": [
+                "launch",
+                "${workspaceFolder}/models/pytorch/train/finetune.py"
+            ],
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/models/pytorch",
+                "ACCELERATE_LOG_LEVEL": "DEBUG",
+                "PYDEVD_DISABLE_FILE_VALIDATION": "1"
             }
         }
     ]
