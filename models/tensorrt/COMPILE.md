@@ -73,3 +73,12 @@ conda create --name bmx --file conda-linux-64.lock
 conda activate bmx
 conda install -n bmx conda-libmamba-solver -y
 conda config --set solver libmamba
+
+
+# docker 
+Docker run -it --rm --net=host --gpus=1 -v /home/ubuntu/bmx/workspace/phi-playground/models/tensorrt/TensorRT-LLM/examples/phi/:/models tritonserver_cibase bin/tritonserver --model-repository /models
+
+
+docker run --rm -it --net host --shm-size=2g --ulimit memlock=-1 --ulimit stack=67108864 --gpus all -v /home/ubuntu/bmx/workspace/tensorrtllm_backend:/tensorrtllm_backend triton_trt_llm bash
+
+docker run --rm -it --net host --shm-size=2g --ulimit memlock=-1 --ulimit stack=67108864 --gpus all -v /path/to/tensorrtllm_backend:/tensorrtllm_backend tritonserver bash
