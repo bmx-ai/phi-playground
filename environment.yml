@@ -1,4 +1,4 @@
-name: bmx
+name: bmx11
 
 channels:
   - nvidia
@@ -11,7 +11,7 @@ channels:
   - nodefaults
 
 dependencies:
-  - python=3.11
+  - python=3.10
   - pytorch-cuda=12.1
   - pytorch
   - torchvision

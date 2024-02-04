@@ -257,7 +257,9 @@ def load_model(model_path: str):
 
 def load_tokenizer(model_path):
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left')
+    tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 
 
 def load(model_path):

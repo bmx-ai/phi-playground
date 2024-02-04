@@ -12,12 +12,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from hashlib import md5
 from typing import Callable, Dict, List, Optional, Tuple, Union
-import logging
+
 
 try:
     import docker
 except ImportError:
-    logging.warning('docker package not found')
     docker = None
 
 SENTINEL = object()

@@ -28,7 +28,7 @@ def main(args):
     modelmod = try_import(args.model_module) 
     evalmodule = try_import(args.evaluation_module) 
 
-    torch.set_default_device('mps')
+    torch.set_default_device('cuda')
     
     model, tokenizer = modelmod.load_from_checkpoint(args.model_storage)
     evalmodule.load_from_storage(args.evaluation_storage)

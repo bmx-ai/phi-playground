@@ -21,7 +21,8 @@
                 "${workspaceFolder}/.cache/datasets/gsm8k"
             ],
             "env": {
-                "PYTHONPATH": "${workspaceFolder}/models/pytorch"
+                "PYTHONPATH": "${workspaceFolder}/models/pytorch",
+                "TOKENIZERS_PARALLELISM": "1"
             }
         },
         {

@@ -8,6 +8,9 @@ import re
 import shutil
 import transformers
 import time
+import time
+import argparse
+import sys
 
 import argparse
 import ast
@@ -16,8 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-# from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
-#                    load_tokenizer, read_model_name, throttle_generator)
+import logging
 
 import tensorrt_llm
 import tensorrt_llm.profiler
@@ -31,16 +33,9 @@ import collections
 import itertools
 import random
 
-import lm_eval.metrics
-import lm_eval.models
-import lm_eval.tasks
-import lm_eval.base
-from lm_eval.utils import positional_deprecated, run_task_tests
-from lm_eval.models.gpt2 import HFLM
 
 import numpy as np
 import transformers
-from lm_eval.evaluator import evaluate
 
 # SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -86,14 +81,6 @@ DEFAULT_HF_MODEL_DIRS = {
     'opt': 'facebook/opt-350m',
     'qwen': 'Qwen/Qwen-7B',
 }
-
-DEFAULT_PROMPT_TEMPLATES = {
-    'internlm':
-    "<|User|>:{input_text}<eoh>\n<|Bot|>:",
-    'qwen':
-    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
-}
-
 
 def read_model_name(engine_dir: str):
     engine_version = tensorrt_llm.runtime.engine.get_engine_version(engine_dir)
@@ -371,6 +358,7 @@ def print_output(tokenizer,
                  context_logits=None,
                  generation_logits=None,
                  output_logits_npy=None):
+
     batch_size, num_beams, _ = output_ids.size()
     if output_csv is None and output_npy is None:
         for batch_idx in range(batch_size):
@@ -426,6 +414,50 @@ def print_output(tokenizer,
                                       dtype='float32')
         np.save(output_generation_logits_file, generation_outputs)
 
+PYTHON_EVAL="""\
+def simple_math_problem() -> float:
+    '''
+{problem}
+    '''\
+"""
+import textwrap
+from code_utils import execute_code
+
+ANS_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+INVALID_ANS = "[invalid]"
+
+
+def extract_answer(completion):
+    match = ANS_RE.search(completion)
+    if match:
+        match_str = match.group(1).strip()
+        match_str = match_str.replace(",", "")
+        return float(match_str)
+    else:
+        return INVALID_ANS
+
+def is_correct(model_completion, answer):
+    gt_answer = extract_answer(answer)
+    assert gt_answer != INVALID_ANS
+    return extract_answer(model_completion) == gt_answer
+
+import datasets
+import huggingface_hub
+
+def load_from_storage(path:str):
+    if not os.path.exists(path):
+       raise ValueError('Path does not exist.')
+    try:
+        ds = datasets.load_dataset('gsm8k', 'main', split='test', cache_dir=path)
+    except Exception as e:
+        # download if not found
+        huggingface_hub.hf_hub_download("gsm8k", cache_dir=path)
+        try:
+            # try to load it again
+            ds = datasets.load_dataset('gsm8k', 'main', cache_dir=path)
+        except:
+            raise e
+    return ds
 
 def load_model(args):
     runtime_rank = tensorrt_llm.mpi_rank()
@@ -455,8 +487,6 @@ def load_model(args):
     bad_words_list = None
 
     prompt_template = None
-    if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
-        prompt_template = DEFAULT_PROMPT_TEMPLATES[model_name]
     batch_input_ids = parse_input(tokenizer=tokenizer,
                                   input_text=args.input_text,
                                   prompt_template=prompt_template,
@@ -466,7 +496,6 @@ def load_model(args):
                                   pad_id=pad_id,
                                   num_prepend_vtokens=args.num_prepend_vtokens,
                                   model_name=model_name)
-    input_lengths = [x.size(0) for x in batch_input_ids]
 
     if not PYTHON_BINDINGS and not args.use_py_session:
         logger.warning(
@@ -490,43 +519,102 @@ def load_model(args):
         assert args.temperature == 0, "Medusa should use temperature == 0"
         assert args.num_beams == 1, "Medusa should use num_beams == 1"
         runner_kwargs.update(medusa_choices=args.medusa_choices)
+
+    runner = runner_cls.from_dir(**runner_kwargs)
+    ds = load_from_storage('.cache') 
+
     if not args.use_py_session:
         runner_kwargs.update(
             max_batch_size=len(batch_input_ids),
-            max_input_len=max(input_lengths),
+            max_input_len=512,
             max_output_len=args.max_output_len,
             max_beam_width=args.num_beams,
             max_attention_window_size=args.max_attention_window_size,
             sink_token_length=args.sink_token_length,
         )
-    runner = runner_cls.from_dir(**runner_kwargs)
-    return runner, tokenizer
-
+    
     with torch.no_grad():
-        outputs = runner.generate(
-            batch_input_ids,
-            max_new_tokens=args.max_output_len,
-            max_attention_window_size=args.max_attention_window_size,
-            sink_token_length=args.sink_token_length,
-            end_id=end_id,
-            pad_id=pad_id,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            num_beams=args.num_beams,
-            length_penalty=args.length_penalty,
-            repetition_penalty=args.repetition_penalty,
-            presence_penalty=args.presence_penalty,
-            frequency_penalty=args.frequency_penalty,
-            stop_words_list=stop_words_list,
-            bad_words_list=bad_words_list,
-            lora_uids=args.lora_task_uids,
-            prompt_table_path=args.prompt_table_path,
-            prompt_tasks=args.prompt_tasks,
-            streaming=args.streaming,
-            output_sequence_lengths=True,
-            return_dict=True,
-            medusa_choices=args.medusa_choices)
+
+        correct = 0
+        total = 0
+        for ex in ds:
+            p = textwrap.wrap(ex['question'])
+            p = textwrap.indent(' ' * 4, '\n'.join(p))
+            question = PYTHON_EVAL.format(problem=p)
+            #code = sample(model, tokenizer, question, 2048)
+            
+            input_ids = tokenizer.encode(question,
+                                            add_special_tokens=args.add_special_tokens,
+                                            truncation=True,
+                                            max_length=args.max_input_length)
+            batch_input_ids = [input_ids]
+            batch_input_ids = [
+                torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
+            ]            
+            input_lengths = [x.size(0) for x in batch_input_ids]
+            outputs = runner.generate(
+                batch_input_ids,
+                max_new_tokens=args.max_output_len,
+                max_attention_window_size=args.max_attention_window_size,
+                sink_token_length=args.sink_token_length,
+                end_id=end_id,
+                pad_id=pad_id,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                num_beams=args.num_beams,
+                length_penalty=args.length_penalty,
+                repetition_penalty=args.repetition_penalty,
+                presence_penalty=args.presence_penalty,
+                frequency_penalty=args.frequency_penalty,
+                stop_words_list=stop_words_list,
+                bad_words_list=bad_words_list,
+                lora_uids=args.lora_task_uids,
+                prompt_table_path=args.prompt_table_path,
+                prompt_tasks=args.prompt_tasks,
+                streaming=args.streaming,
+                output_sequence_lengths=True,
+                return_dict=True,
+                medusa_choices=args.medusa_choices
+            )
+            output_ids = outputs['output_ids']
+            sequence_lengths = outputs['sequence_lengths']
+            context_logits = None
+            generation_logits = None
+            if runner.gather_context_logits:
+                context_logits = outputs['context_logits']
+            if runner.gather_generation_logits:
+                generation_logits = outputs['generation_logits']
+            batch_size, num_beams, _ = output_ids.size()
+            for batch_idx in range(batch_size):
+                inputs = output_ids[batch_idx][0][:input_lengths[batch_idx]].tolist(
+                )
+                input_text = tokenizer.decode(inputs)
+                print(f'Input [Text {batch_idx}]: \"{input_text}\"')
+                for beam in range(num_beams):
+                    output_begin = input_lengths[batch_idx]
+                    output_end = sequence_lengths[batch_idx][beam]
+                    outputs = output_ids[batch_idx][beam][
+                        output_begin:output_end].tolist()
+                    output_text = tokenizer.decode(outputs)
+                    print(
+                        f'Output [Text {batch_idx} Beam {beam}]: \"{output_text}\"')            
+            code = output_text
+            try:
+                timeout = 60 # sec
+                exit_code, result, _ = execute_code(code + '\nprint("####", simple_math_problem())', timeout=timeout, use_docker=True)
+                success = exit_code == 0
+                ok = is_correct(result, ex['answer'])
+                result = result.strip()
+                if ok:
+                    correct += 1
+                print(ex['answer'], result, ": ok ? ", ok)
+                print('='*80)
+            except:
+                logging.error("could not evaluate", exc_info=True)
+            total += 1
+        return { "accuracy": correct / float(total) }
+
         torch.cuda.synchronize()
 
     if args.streaming:
@@ -623,286 +711,14 @@ def load_model(args):
         )
 
 
-# --------------- eval ---
-EXT_TASKS = ['wikitext2', 'ptb', 'c4', 'ptb-new', 'c4-new']
-fewshots_dict = {}
-fewshots_dict['paper'] = {
-    "lambada_openai": [0],
-    "hellaswag": [0],
-    "winogrande": [0],
-    "piqa": [0],
-    "hendrycksTest-*": [0],
-    "wikitext": [0],
-    "truthfulqa_mc": [0],
-    "openbookqa": [0],
-    "boolq": [0],
-    "rte": [0],
-    "arc_easy": [0],
-    "arc_challenge": [0],
-}
-fewshots_dict['leadboard'] = {
-    "hellaswag": [10],
-    "winogrande": [5],
-    "arc_easy": [25],
-    "arc_challenge": [25],
-    "hendrycksTest-*": [5],
-    "drop": [3],
-    "gsm8k": [5],
-}
-fewshots_dict['all'] = {
-    "lambada_openai": [0],
-    "hellaswag": [0, 10],
-    "winogrande": [0, 5],
-    "piqa": [0],
-    "coqa": [],  ## coqa is not enabled in llamav1 models
-    "truthfulqa_mc": [0],
-    "openbookqa": [0],
-    "boolq": [0],
-    "rte": [0],
-    "arc_easy": [0, 25],
-    "arc_challenge": [0, 25],
-    "hendrycksTest-*": [0, 5],
-    "wikitext": [0],
-    "drop": [3],
-    "gsm8k": [5]
-}
-
-
-def simple_evaluate(
-        model,
-        model_args=None,
-        tasks=[],
-        num_fewshot=0,
-        batch_size=None,
-        max_batch_size=None,
-        device=None,
-        no_cache=True,
-        limit=None,
-        bootstrap_iters=100000,
-        description_dict=None,
-        check_integrity=False,
-        decontamination_ngrams_path=None,
-        write_out=False,
-        output_base_path=None,
-        lm=None
-):
-    """Instantiate and evaluate a model on a list of tasks.
-
-    :param model: Union[str, LM]
-        Name of model, transformers.PreTrainedModel object, or LM object, see lm_eval.models.get_model
-    :param model_args: Optional[str]
-        String arguments for each model class, see LM.create_from_arg_string.
-        Ignored if `model` argument is a LM object.
-    :param tasks: list[Union[str, Task]]
-        List of task names or Task objects. Task objects will be taken to have name task.EVAL_HARNESS_NAME if defined and type(task).__name__ otherwise.
-    :param num_fewshot: int
-        Number of examples in few-shot context
-    :param batch_size: int or str, optional
-        Batch size for model
-    :param max_batch_size: int, optional
-        Maximal batch size to try with automatic batch size detection
-    :param device: str, optional
-        PyTorch device (e.g. "cpu" or "cuda:0") for running models
-    :param no_cache: bool
-        Whether or not to cache
-    :param limit: int or float, optional
-        Limit the number of examples per task (only use this for testing), If <1, limit is a percentage of the total number of examples.
-    :param bootstrap_iters:
-        Number of iterations for bootstrap statistics
-    :param description_dict: dict[str, str]
-        Dictionary of custom task descriptions of the form: `task_name: description`
-    :param check_integrity: bool
-        Whether to run the relevant part of the test suite for the tasks
-    :param write_out: bool
-        If True, write details about prompts and logits to json for all tasks
-    :param output_base_path: str, optional
-        Directory to which detailed eval info will be written. Defaults to present working dir.
-    :return
-        Dictionary of results
-    """
-
-    random.seed(1234)
-    np.random.seed(1234)
-
-    assert tasks != [], "No tasks specified"
-    if lm == None:
-        if isinstance(model, str):
-            if model_args is None:
-                model_args = ""
-            lm = lm_eval.models.get_model(model).create_from_arg_string(
-                model_args,
-                {
-                    "batch_size": batch_size,
-                    "max_batch_size": max_batch_size,
-                    "device": device,
-                },
-            )
-        elif isinstance(model, transformers.PreTrainedModel):
-            lm = lm_eval.models.get_model("hf-causal")(
-                pretrained=model,
-                batch_size=batch_size,
-                max_batch_size=max_batch_size,
-            )
-            no_cache = True
-        else:
-            assert isinstance(model, lm_eval.base.LM)
-            lm = model
-
-        if not no_cache:
-            lm = lm_eval.base.CachingLM(
-                lm,
-                "lm_cache/"
-                + (model if isinstance(model, str) else model.model.config._name_or_path)
-                + "_"
-                + model_args.replace("=", "-").replace(",", "_").replace("/", "-")
-                + ".db",
-            )
-
-    task_dict = lm_eval.tasks.get_task_dict(tasks)
-
-    results = evaluate(
-        lm=lm,
-        task_dict=task_dict,
-        num_fewshot=num_fewshot,
-        limit=limit,
-        bootstrap_iters=bootstrap_iters,
-        description_dict=description_dict,
-        decontamination_ngrams_path=decontamination_ngrams_path,
-        write_out=write_out,
-        output_base_path=output_base_path,
-    )
-
-    # add info about the model and few shot config
-    model_name = None
-    if isinstance(model, str):
-        model_name = model
-    elif isinstance(model, transformers.PreTrainedModel):
-        model_name = "pretrained=" + model.config._name_or_path
-    results["config"] = {
-        "model": model_name,
-        "model_args": model_args,
-        "num_fewshot": num_fewshot,
-        "batch_size": batch_size,
-        "batch_sizes": list(lm.batch_sizes.values())
-        if hasattr(lm, "batch_sizes")
-        else [],
-        "device": device,
-        "no_cache": no_cache,
-        "limit": limit,
-        "bootstrap_iters": bootstrap_iters,
-        "description_dict": description_dict,
-    }
-
-    return results, lm
-
-import lm_eval
-from lm_eval import evaluator
-from lm_eval.tasks import ALL_TASKS, get_task_dict
-#from eval.utils import get_loaders, eval_ppl_same_with_gptq
-
-def eval_model(output_dir=None, model=None, tokenizer=None,
-               tasks=["lambada_openai", "hellaswag", "winogrande", "piqa"],
-               eval_bs=32, use_accelerate=True, dtype="float16", limit=None,
-               device="cuda:0", seed=0, nsamples=128, eval_orig_float=False, mark="paper", excel_file="tmp.xlsx"):
-    
-    print("evaluation with official lm-eval", flush=True)
-
-    org_s = time.time()
-    if os.path.exists(output_dir) and not eval_orig_float:
-        shutil.rmtree(output_dir)
-    
-    if (hasattr(model, 'config') and model.config.torch_dtype is torch.bfloat16):
-        dtype = 'bfloat16'
-        pt_dtype = torch.bfloat16
-    else:
-        pt_dtype = torch.float16
-        
-    # if not eval_orig_float:
-    #     model = model.to(pt_dtype)
-    #     model = model.to("cpu")
-    #     model.save_pretrained(output_dir)
-    #     tokenizer.save_pretrained(output_dir)
-
-    external_tasks = []
-    for each in EXT_TASKS:
-        if each in tasks:
-            external_tasks.append(each)
-            tasks.remove(each)
-
-    results = {}
-    model = None
-    lm = None
-    for tmp_tasks in tasks:
-        try:
-            num_fewshot = fewshots_dict[mark][tmp_tasks]
-            task_names = lm_eval.utils.pattern_match([tmp_tasks], ALL_TASKS)
-            print(f'********* {tmp_tasks} evaluate ************')
-            task_s = time.time()
-            for shot in num_fewshot:
-                if bool(re.search("chatglm", output_dir.lower())):
-                    model_args = f'pretrained={output_dir},tokenizer={output_dir},dtype={dtype},trust_remote_code=True'
-                    model_type = "hf-causal"
-                else:
-                    model_args = f'pretrained={output_dir},tokenizer={output_dir},dtype={dtype},use_accelerate={use_accelerate},trust_remote_code=True'
-                    model_type = "hf-causal-experimental"
-
-                if "wikitext" in task_names:
-                    tmp_eval_bs = 1
-                else:
-                    tmp_eval_bs = eval_bs
-                tmp_results, lm = simple_evaluate(model=model_type, model_args=model_args, tasks=task_names,
-                                                  num_fewshot=shot, limit=limit, batch_size=tmp_eval_bs,
-                                                  max_batch_size=tmp_eval_bs, lm=lm)
-                sub_name = f'{tmp_tasks} {shot}-shot'
-                print(f'{sub_name}: ')
-                pprint.pprint(tmp_results["results"])
-                print(f"\n{sub_name} cost time: {time.time() - task_s}\n")
-                results[sub_name] = tmp_results
-        except Exception as e:
-            print(f'********* {tmp_tasks} ERROR ************')
-            print(str(e))
-            continue
-    model.seqlen = 2048
-    for dataset in external_tasks:
-        try:
-            dataloader, testloader = get_loaders(
-                dataset, nsamples=nsamples, seed=seed,
-                tokenizer=tokenizer, seqlen=model.seqlen
-            )
-            ppl = eval_ppl_same_with_gptq(model, testloader, device)
-            print(dataset, ppl)
-
-            results.update({dataset: ppl})
-        except Exception as e:
-            print(str(e))
-            continue
-
-
-import time
-import argparse
-import sys
-
-
 if __name__ == "__main__":
     args = parse_arguments()
     s = time.time()
 
-    test_tasks = ['wikitext2', 'ptb-new', 'c4-new', 'lambada_openai', 'hellaswag', 'winogrande', 'piqa',
-                  "hendrycksTest-*", "wikitext", "truthfulqa_mc", "openbookqa", "boolq", "rte", "arc_easy",
-                  "arc_challenge"]
-    
     model_name = read_model_name(args.engine_dir)
 
-    runner, tokenizer= load_model(args)
+    load_model(args)
     
-    tasks = ['gsm8k'] 
-    task_dict = lm_eval.tasks.get_task_dict(tasks)
-    # eval_model(output_dir=model_name,
-    #            tasks=test_tasks,
-    #            eval_bs=args.eval_bs, 
-    #            eval_orig_float=True, 
-    #            limit=None)
-
     print("cost time: ", time.time() - s)
     
     

@@ -4,9 +4,11 @@ import datasets
 import huggingface_hub
 import torch
 import logging
+import concurrent.futures
 
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
-
+os.environ['TOKENIZERS_PARALLELISM']="1"
+           
 ds = None
 def load_from_storage(path:str):
     global ds
@@ -24,7 +26,7 @@ def load_from_storage(path:str):
             raise e
 
 
-def sample(model, tokenizer, prompt, sample_len):
+def stream_sample(model, tokenizer, prompt, sample_len):
     outidx = 0
     answer = prompt
     for _ in range(sample_len):
@@ -33,11 +35,11 @@ def sample(model, tokenizer, prompt, sample_len):
             orig_len = toks["input_ids"].shape[1]
 
             out = model.generate(
-                **toks, max_length=orig_len + 1, pad_token_id=tokenizer.eos_token_id, use_cache=True
+                **toks, max_length=sample_len, pad_token_id=tokenizer.eos_token_id, use_cache=True
             )
             text = tokenizer.batch_decode(out, skip_special_tokens=False)[0]
-            print(text[outidx:], end="", flush=True)
-            outidx = len(text) 
+            # print(text[outidx:], end="", flush=True)
+            # outidx = len(text) 
             if text.strip().endswith("<|endoftext|>"):
                 break
             # # this function triggers a calculator when it sees an equal token
@@ -51,6 +53,16 @@ def sample(model, tokenizer, prompt, sample_len):
     print()
     print('-'*80)
     return answer
+
+from torchtext.data import BucketIterator
+
+def sample(model, tokenizer, prompts, sample_len):
+    tokenizer.pad_token = tokenizer.eos_token
+    toks = tokenizer(prompts, padding=True, truncation=False, return_tensors="pt").to(model.device)
+    out = model.generate(
+        **toks, max_length=sample_len, pad_token_id=tokenizer.eos_token_id, use_cache=True
+    )
+    return tokenizer.batch_decode(out, skip_special_tokens=False)
 
 ANS_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
 INVALID_ANS = "[invalid]"
@@ -74,33 +86,99 @@ def is_correct(model_completion, answer):
 PYTHON_EVAL="""\
 def simple_math_problem() -> float:
     '''
-    {problem}
+{problem}
     '''\
 """
 import textwrap
-
 from code_utils import execute_code
+from tqdm.auto import tqdm
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import pandas as pd
+
+
+def test_example(batch, model, tokenizer):
+    tokenizer.padding_side = 'left'
+    tokenizer.pad_token = "\n"
+    prompts = []
+    for ex in batch['question']:
+        p = textwrap.wrap(ex)
+        p = textwrap.indent('\n'.join(p), ' ' * 4)
+        question = PYTHON_EVAL.format(problem=p)
+        prompts.append(question)
+    batch['prompt'] = prompts
+
+    outputs = sample(model, tokenizer, batch['prompt'], 512)
+    batch['outputs'] = outputs
+    df = pd.DataFrame(batch)
+    return df
+ 
+
+
+@torch.no_grad
 def evaluate(model, tokenizer):
     correct = 0
     total = 0
-    for ex in ds:
-        p = textwrap.wrap(ex['question'])
-        # p = textwrap.indent('\n'.join(p))
-        question = PYTHON_EVAL.format(problem='\n'.join(p))
-        code = sample(model, tokenizer, question, 2048)
+    model.eval()
+    timeout = 60
+    crashes = 0
+    
+    import torch.utils.data
+    # batches = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False)
+    batches = BucketIterator(ds, batch_size=8, device='cuda', sort_key=lambda x: len(tokenizer(x['question'][0])))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
         try:
-            timeout = 60 # sec
-            exit_code, result, _ = execute_code(code + '\nprint("####", simple_math_problem())', timeout=timeout, use_docker=True)
-            success = exit_code == 0
-            ok = is_correct(result, ex['answer'])
-            result = result.strip()
-            if ok:
-                correct += 1
-            print(ex['answer'], result, ": ok ? ", ok)
-            print('='*80)
-        except:
-            logging.error("could not evaluate", exc_info=True)
-        total += 1
-    return { "accuracy": correct / float(total) }
+            futures = set()
+            for ex in tqdm(batches, desc='submiting'):
+                future = executor.submit(
+                    test_example,
+                    ex,
+                    model,
+                    tokenizer
+                )
+                futures.add(future)
+
+            pbar = tqdm(total=len(ds), desc='processing:')
+            metrics = { "correct": 0, "crashes": 0, 'total':0}
+            with ThreadPoolExecutor(max_workers=16) as executor_two:
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        futures_two = set()
+                        df = future.result(timeout=timeout)
+                        for idx, ex in df.iterrows():
+                            task = executor_two.submit(
+                                
+                                execute_code,
+                                ex['outputs'].replace('<|endoftext|>', '').strip()+ '\nprint("####", simple_math_problem())',
+                                timeout=timeout, 
+                                use_docker=True
+                            )
+                            futures_two.add(task)
+                            
+                        for task in concurrent.futures.as_completed(futures_two):
+                            try:
+                                pbar.update(1)
+                                metrics['total'] += 1
+                                exit_code, result, _ = task.result(timeout=timeout)
+                                timeout = 60 # sec
+                                success = exit_code == 0
+                                if not success:
+                                    metrics['crashes'] += 1
+                                ok = is_correct(result, ex['answer'])
+                                if ok: 
+                                    metrics['correct'] += 1
+                            except:
+                                logging.error("could not evaluate", exc_info=True)   
+                                continue
+                        correct = metrics['correct']
+                        total = metrics['total']
+                        pbar.set_description("accuracy: %.2f" % (correct / float(total)))
+                except TimeoutError:
+                    logging.error('timeout', exc_info=True)
+                except Exception as e:
+                    logging.error('error: %s',e, exc_info=True)
+        except Exception as e:
+            logging.error('error: %s',e, exc_info=True)
+    return { "accuracy": correct / float(total), "crashes": crashes }
     
