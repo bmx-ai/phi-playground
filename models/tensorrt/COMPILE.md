@@ -1,12 +1,12 @@
 ```
-sudo apt install git git-lfs openmpi-bin libopenmpi-dev
+sudo apt install git git-lfs openmpi-bin libopenmpi-dev -y
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 git checkout b57221b764bc579cbb2490154916a871f620e2c4 -b phi
 git submodule update --init --recursive
 git lfs install
 git lfs pull
-make -C docker release_build CUDA_ARCHS="86-real"
+make -C docker release_build CUDA_ARCHS=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader)
 LOCAL_USER=1 make -C docker release_run
 # inside the docker
 cd /code/tensorrt_llm/examples/phi
