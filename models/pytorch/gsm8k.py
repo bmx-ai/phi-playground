@@ -12,8 +12,6 @@ os.environ['TOKENIZERS_PARALLELISM']="1"
 ds = None
 def load_from_storage(path:str):
     global ds
-    if not os.path.exists(path):
-       raise ValueError('Path does not exist.')
     try:
         ds = datasets.load_dataset('gsm8k', 'main', split='test', cache_dir=path)
     except Exception as e:
@@ -53,8 +51,6 @@ def stream_sample(model, tokenizer, prompt, sample_len):
     print()
     print('-'*80)
     return answer
-
-from torchtext.data import BucketIterator
 
 def sample(model, tokenizer, prompts, sample_len):
     tokenizer.pad_token = tokenizer.eos_token
@@ -112,9 +108,17 @@ def test_example(batch, model, tokenizer):
     batch['outputs'] = outputs
     df = pd.DataFrame(batch)
     return df
- 
 
+from collections import defaultdict 
 
+def submit_example(ex, timeout):
+    success, result, _ = execute_code(ex['outputs'].replace('<|endoftext|>', '').strip()+ '\nprint("####", simple_math_problem())',
+        timeout=timeout, 
+        use_docker=True)
+    ex['success'] = success
+    ex['result'] = result
+    return ex
+    
 @torch.no_grad
 def evaluate(model, tokenizer):
     correct = 0
@@ -125,20 +129,32 @@ def evaluate(model, tokenizer):
     
     import torch.utils.data
     # batches = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False)
-    batches = BucketIterator(ds, batch_size=8, device='cuda', sort_key=lambda x: len(tokenizer(x['question'][0])))
+    # batches = BucketIterator(ds, batch_size=8, device='cuda', sort_key=lambda x: len(tokenizer(x['question'][0])))
 
+    # try to group questions of the same length
+    buckets = defaultdict(list)
+    for ex in ds:
+        txt = ex['question']
+        toks = tokenizer([txt], padding=False, return_tensors="pt")
+        token_len = len(toks[0])
+        buckets[token_len].append(ex)
+        
     with ThreadPoolExecutor(max_workers=1) as executor:
         try:
             futures = set()
-            for ex in tqdm(batches, desc='submiting'):
-                future = executor.submit(
-                    test_example,
-                    ex,
-                    model,
-                    tokenizer
-                )
-                futures.add(future)
-
+            pbar = tqdm(total=len(ds), desc='creating batches')
+            for bucket_len, bucket in buckets.items():
+                batches = torch.utils.data.DataLoader(bucket, batch_size=8, shuffle=False) 
+                for batch in batches:
+                    future = executor.submit(
+                        test_example,
+                        batch,
+                        model,
+                        tokenizer
+                    )
+                    futures.add(future)
+                    pbar.update(len(batch))
+                    
             pbar = tqdm(total=len(ds), desc='processing:')
             metrics = { "correct": 0, "crashes": 0, 'total':0}
             with ThreadPoolExecutor(max_workers=16) as executor_two:
@@ -148,11 +164,7 @@ def evaluate(model, tokenizer):
                         df = future.result(timeout=timeout)
                         for idx, ex in df.iterrows():
                             task = executor_two.submit(
-                                
-                                execute_code,
-                                ex['outputs'].replace('<|endoftext|>', '').strip()+ '\nprint("####", simple_math_problem())',
-                                timeout=timeout, 
-                                use_docker=True
+                                submit_example, ex, timeout
                             )
                             futures_two.add(task)
                             
@@ -160,20 +172,20 @@ def evaluate(model, tokenizer):
                             try:
                                 pbar.update(1)
                                 metrics['total'] += 1
-                                exit_code, result, _ = task.result(timeout=timeout)
+                                ex = task.result(timeout=timeout)
                                 timeout = 60 # sec
-                                success = exit_code == 0
+                                success = ex['success'] == 0
                                 if not success:
                                     metrics['crashes'] += 1
-                                ok = is_correct(result, ex['answer'])
+                                ok = is_correct(ex['result'], ex['answer'])
                                 if ok: 
                                     metrics['correct'] += 1
                             except:
                                 logging.error("could not evaluate", exc_info=True)   
-                                continue
-                        correct = metrics['correct']
-                        total = metrics['total']
-                        pbar.set_description("accuracy: %.2f" % (correct / float(total)))
+                            
+                            correct = metrics['correct']
+                            total = metrics['total']
+                            pbar.set_description("accuracy: %.2f" % (correct / float(total)))
                 except TimeoutError:
                     logging.error('timeout', exc_info=True)
                 except Exception as e:

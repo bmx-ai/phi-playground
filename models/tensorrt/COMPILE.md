@@ -43,9 +43,9 @@ python eval.py --max_output_len=50 --engine_dir=/code/tensorrt_llm/TensorRT-LLM/
 
 
 # Run the build script. The flags for some features or endpoints can be removed if not needed.
-BASE_CONTAINER_IMAGE_NAME=nvcr.io/nvidia/tritonserver:23.10-py3-min
-TENSORRTLLM_BACKEND_REPO_TAG=releases/v0.7.2
-PYTHON_BACKEND_REPO_TAG=r23.10
+BASE_CONTAINER_IMAGE_NAME=nvcr.io/nvidia/tritonserver:23.12-py3-min
+TENSORRTLLM_BACKEND_REPO_TAG=r23.12
+PYTHON_BACKEND_REPO_TAG=r23.12
 
 ./build.py -v --no-container-interactive --enable-logging --enable-stats --enable-tracing \
               --enable-metrics --enable-gpu-metrics --enable-cpu-metrics \
@@ -55,3 +55,21 @@ PYTHON_BACKEND_REPO_TAG=r23.10
               --image=base,${BASE_CONTAINER_IMAGE_NAME} \
               --backend=tensorrtllm:${TENSORRTLLM_BACKEND_REPO_TAG} \
               --backend=python:${PYTHON_BACKEND_REPO_TAG}
+
+
+# SEUTP LOCAL
+mkdir -p .cache/models/microsoft && HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download microsoft/phi-2 --local-dir .cache/models/microsoft/phi-2 --local-dir-use-symlinks False 
+
+# Install Miniconda
+curl -so ~/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-py311_23.11.0-2-Linux-x86_64.sh  \
+    && bash ~/miniconda.sh -b -p ~/.my_miniconda \
+    && ~/.my_miniconda/bin/conda init bash \
+    && rm ~/miniconda.sh
+
+bash --login 
+conda install -n base conda-libmamba-solver -y
+conda config --set solver libmamba
+conda create --name bmx --file conda-linux-64.lock
+conda activate bmx
+conda install -n bmx conda-libmamba-solver -y
+conda config --set solver libmamba
