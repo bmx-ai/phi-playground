@@ -52,11 +52,11 @@ def stream_sample(model, tokenizer, prompt, sample_len):
     print('-'*80)
     return answer
 
-def sample(model, tokenizer, prompts, sample_len):
+def sample(model, tokenizer, prompts, sample_len, **genargs):
     tokenizer.pad_token = tokenizer.eos_token
     toks = tokenizer(prompts, padding=True, truncation=False, return_tensors="pt").to(model.device)
     out = model.generate(
-        **toks, max_length=sample_len, pad_token_id=tokenizer.eos_token_id, use_cache=True
+        **toks, max_length=sample_len, pad_token_id=tokenizer.eos_token_id, use_cache=True, **genargs
     )
     return tokenizer.batch_decode(out, skip_special_tokens=False)
 
@@ -91,36 +91,61 @@ from tqdm.auto import tqdm
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import pandas as pd
+import hashlib
 
-
-def test_example(batch, model, tokenizer):
+def test_example(batch, model, tokenizer, shots, genargs):
     tokenizer.padding_side = 'left'
     tokenizer.pad_token = "\n"
     prompts = []
+    ids = []
     for ex in batch['question']:
+        md5 = hashlib.md5(ex.encode('utf-8')).hexdigest()
         p = textwrap.wrap(ex)
         p = textwrap.indent('\n'.join(p), ' ' * 4)
         question = PYTHON_EVAL.format(problem=p)
-        prompts.append(question)
+        for _ in range(shots):
+            prompts.append(question)
+            ids.append(md5)
     batch['prompt'] = prompts
+    batch['md5'] = ids
 
-    outputs = sample(model, tokenizer, batch['prompt'], 512)
+    outputs = sample(model, tokenizer, batch['prompt'], 512, **genargs)
     batch['outputs'] = outputs
     df = pd.DataFrame(batch)
     return df
 
-from collections import defaultdict 
+from collections import defaultdict, Counter
 
-def submit_example(ex, timeout):
-    success, result, _ = execute_code(ex['outputs'].replace('<|endoftext|>', '').strip()+ '\nprint("####", simple_math_problem())',
-        timeout=timeout, 
-        use_docker=True)
-    ex['success'] = success
-    ex['result'] = result
-    return ex
+def submit_example(ex_group, timeout):
+    candidates = Counter()
+    for ix, ex in ex_group.iterrows():
+        success, result, _ = execute_code(ex['outputs'].replace('<|endoftext|>', '').strip()+ '\nprint("####", simple_math_problem())',
+            timeout=timeout, 
+            use_docker=True)
+        ex['success'] = success
+        ex['result'] = result
+        # TODO reduce here 
+        if result != '[invalid]':
+            # normalize
+            try:
+                value = float(extract_answer(result))
+                value = "#### %.02f" % value
+            except ValueError:
+                value = '[invalid]'  
+        else:
+            value = '[invalid]'
+
+        candidates[value] += 1
+    # reduce
+    return {
+        'question': ex['question'],
+        'answer': ex['answer'],
+        'success': len(candidates) > 0, 
+        'result': candidates.most_common()[0][0]
+    }
     
 @torch.no_grad
-def evaluate(model, tokenizer):
+def evaluate(model, tokenizer, shots, genargs):
     correct = 0
     total = 0
     model.eval()
@@ -150,7 +175,9 @@ def evaluate(model, tokenizer):
                         test_example,
                         batch,
                         model,
-                        tokenizer
+                        tokenizer,
+                        shots,
+                        genargs
                     )
                     futures.add(future)
                     pbar.update(len(batch))
@@ -162,9 +189,9 @@ def evaluate(model, tokenizer):
                     for future in concurrent.futures.as_completed(futures):
                         futures_two = set()
                         df = future.result(timeout=timeout)
-                        for idx, ex in df.iterrows():
+                        for id, ex_group in df.groupby('md5'):
                             task = executor_two.submit(
-                                submit_example, ex, timeout
+                                submit_example, ex_group, timeout
                             )
                             futures_two.add(task)
                             
