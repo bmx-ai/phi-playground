@@ -97,8 +97,11 @@ def test_example(batch, model, tokenizer, shots, genargs):
     tokenizer.padding_side = 'left'
     tokenizer.pad_token = "\n"
     prompts = []
+    questions = []
+    answers = []
     ids = []
-    for ex in batch['question']:
+    
+    for idx, ex in enumerate(batch['question']):
         md5 = hashlib.md5(ex.encode('utf-8')).hexdigest()
         p = textwrap.wrap(ex)
         p = textwrap.indent('\n'.join(p), ' ' * 4)
@@ -106,8 +109,13 @@ def test_example(batch, model, tokenizer, shots, genargs):
         for _ in range(shots):
             prompts.append(question)
             ids.append(md5)
+            answers.append(batch['answer'][idx])
+            questions.append(batch['question'][idx])
     batch['prompt'] = prompts
     batch['md5'] = ids
+    # has to overwrite
+    batch['answer'] = answers
+    batch['question'] = questions
 
     outputs = sample(model, tokenizer, batch['prompt'], 512, **genargs)
     batch['outputs'] = outputs
@@ -169,7 +177,7 @@ def evaluate(model, tokenizer, shots, genargs):
             futures = set()
             pbar = tqdm(total=len(ds), desc='creating batches')
             for bucket_len, bucket in buckets.items():
-                batches = torch.utils.data.DataLoader(bucket, batch_size=8, shuffle=False) 
+                batches = torch.utils.data.DataLoader(bucket, batch_size=2, shuffle=False) 
                 for batch in batches:
                     future = executor.submit(
                         test_example,

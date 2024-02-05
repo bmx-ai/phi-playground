@@ -14,7 +14,7 @@ def parse_arguments(args):
     parser.add_argument("--evaluation_module", type=str, help="name of the evaluation module")
     parser.add_argument("--evaluation_storage", type=str, help="name of the evaluation storage")
     parser.add_argument("--output_folder", type=str, help="Path to the output folder")
-    parser.add_argument("--number_of_shots", type=int, help="Number of shots", default=1)
+    parser.add_argument("--number_of_shots", type=int, help="Number of shots", default=8)
     return parser.parse_args(args)
 
 def try_import(modelname):
